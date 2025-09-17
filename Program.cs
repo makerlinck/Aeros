@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using VRageMath;
+using static AerOS.Program;
 
 namespace AerOS
 {
@@ -12,7 +13,7 @@ namespace AerOS
         private readonly DependencyContainer _dependencies = new DependencyContainer();
 
         private FlightController FC;
-        private ChannelIO CH;
+        private IGCIO CH;
         private long _lastRunTime;
         private Logger logger;
         public Program()
@@ -36,7 +37,7 @@ namespace AerOS
             foreach (IMyBroadcastListener _ch in CH.GetSubscriptions())
             {
                 FC.SetTargetAttitude((MatrixD)CH.GetMessage(_ch).Data);
-                FC.Update(deltaTime);
+                FC.UpdateAttitude(deltaTime);
             }
             DisplayLogger();
         }
@@ -70,7 +71,7 @@ namespace AerOS
             // 创建飞行控制器
             FC = new FlightController(_dependencies);
             //  创建通信IO控制器
-            CH = new ChannelIO(_dependencies, "");
+            CH = new IGCIO(_dependencies, "");
         }
         private int logc = 1000;
         private void DisplayLogger()
@@ -124,10 +125,10 @@ namespace AerOS
 
         public interface IFlightController
         {
-            void Update(double deltaTime);
+            void UpdateAttitude(double deltaTime);
             void SetTargetAttitude(MatrixD targetAttitude);
         }
-        public interface IChannelIO
+        public interface IIGCIO
         {
             void Subscribe(string channel_id);
             void Unsubscribe(IMyBroadcastListener listener);
@@ -169,9 +170,7 @@ namespace AerOS
             public double Ki { get; set; }
             public double Kd { get; set; }
 
-            private Vector3D _integral = Vector3D.Zero;
-            private Vector3D _previousError = Vector3D.Zero;
-            private Vector3D _previousDerivative = Vector3D.Zero;
+            private Vector3D _integral = Vector3D.Zero, _previousError = Vector3D.Zero, _previousDerivative = Vector3D.Zero;
 
             public PIDController(double kp, double ki, double kd)
             {
@@ -212,11 +211,12 @@ namespace AerOS
                 _previousDerivative = Vector3D.Zero;
             }
         }
-        // 飞控
+
         public class FlightController : IFlightController
         {
             private readonly IMyShipController _controller;
             private readonly List<IMyGyro> _gyros;
+            private readonly List<IMyThrust> _thrusts;
             private readonly IPIDController _pidController;
             private Vector3D _previousAngularVelocity = Vector3D.Zero;
             private MatrixD _targetAttitude;
@@ -231,6 +231,7 @@ namespace AerOS
             {
                 _controller = dependencies.Resolve<IMyShipController>();
                 _gyros = dependencies.Resolve<List<IMyGyro>>();
+                _thrusts = dependencies.Resolve<List<IMyThrust>>();
 
                 // 获取配置参数
                 var config = dependencies.Resolve<FlightControllerConfig>();
@@ -245,19 +246,15 @@ namespace AerOS
                 _targetAttitude = _controller.WorldMatrix;
             }
 
-            public void Update(double deltaTime)
+            public void UpdateAttitude(double deltaTime)
             {
-                if (_controller == null || _gyros == null || _gyros.Count == 0) return;
-
                 // 获取当前角速度
                 var currentAngularVelocity = _controller.GetShipVelocities().AngularVelocity;
                 // 计算当前姿态与目标姿态之间的误差
                 var error = CalculateAttitudeError(_controller.WorldMatrix, _targetAttitude);
                 var errorMagnitude = error.Length();
-
                 // 预测制动点
-                var predictedStopDistance = PredictStopDistance(currentAngularVelocity);
-
+                var predictedStopDistance = PredictStopAngle(currentAngularVelocity);
                 // 控制逻辑
                 Vector3D desiredAngularVelocity;
 
@@ -283,7 +280,6 @@ namespace AerOS
                         desiredAngularVelocity = Vector3D.Zero;
                     }
                 }
-
                 // 应用指令
                 ApplyAngularVelocity(desiredAngularVelocity);
             }
@@ -295,11 +291,23 @@ namespace AerOS
                 _previousAngularVelocity = Vector3D.Zero; // 重置角速度历史
             }
 
-            // 预测停止距离（基于当前角速度）
-            private double PredictStopDistance(Vector3D currentAngularVelocity)
+            // 预测停止角度（基于当前角速度）
+            private double PredictStopAngle(Vector3D currentAngularVelocity)
             {
                 double maxAngularAcceleration = _maxAngularVelocity * 2; // 根据实际情况调整
                 return (currentAngularVelocity.LengthSquared()) / (2 * maxAngularAcceleration);
+            }
+
+            // 应用推进器，返回应用的总推力
+            private float ApplyThrust(float percentOfThrust)
+            {
+                float currentThrust = 0;
+                foreach (var thrust in _thrusts)
+                {
+                    thrust.ThrustOverridePercentage = percentOfThrust;
+                    currentThrust += thrust.CurrentThrust;
+                }
+                return currentThrust;
             }
 
             private void ApplyAngularVelocity(Vector3D angularVelocity)
@@ -326,7 +334,6 @@ namespace AerOS
                     gyro.Roll = (float)localAxis.Z;
                 }
             }
-
             // ==================== 工具函数 ====================
             private Vector3D CalculateAttitudeError(MatrixD current, MatrixD target)
             {
@@ -376,14 +383,41 @@ namespace AerOS
             }
         }
 
+        public class VehicleController : FlightController
+        {
+            private enum ControllingType
+            {
+                SpaceJet,   // 太空舰艇
+                Spaceship,  // 太空飞船
+                VTOL,   // 垂直起降多用途飞行器
+                Auxiliary,  // 辅助驾驶
+            }
+            public VehicleController(DependencyContainer dependencies) : base(dependencies)
+            {
+            }
+        }
+        public class MissileController : FlightController
+        {
+            private enum ControllingType
+            {
+                BeamRider,  // 激光制导
+                Inertial,   // 惯性制导
+                ActiveHoming,   // 主动寻的
+                SemiHoming, // 半主动寻的
+                PassiveHoming,  // 被动寻的
+            }
+            public MissileController(DependencyContainer dependencies) : base(dependencies)
+            {
+            }
+        }
         // 通讯
-        public class ChannelIO : IChannelIO
+        public class IGCIO : IIGCIO
         {
             private readonly IMyIntergridCommunicationSystem _IGC;
             private readonly List<IMyBroadcastListener> ChannelListeners = new List<IMyBroadcastListener>();
             private readonly List<IMyBroadcastListener> ChannelHosts = new List<IMyBroadcastListener>();
             private MyIGCMessage news;
-            public ChannelIO(DependencyContainer dependencies, string pri_key = "")
+            public IGCIO(DependencyContainer dependencies, string pri_key = "")
             {
                 news = new MyIGCMessage();
                 _IGC = dependencies.Resolve<IMyIntergridCommunicationSystem>();
@@ -472,6 +506,7 @@ namespace AerOS
         // 飞控配置
         public struct FlightControllerConfig
         {
+            int controllingType;
             public IPIDController PIDController;
             public double MaxAngularVelocity { get; set; }
             public double BrakeThreshold { get; set; }
