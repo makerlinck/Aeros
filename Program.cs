@@ -1,6 +1,7 @@
 ﻿using Sandbox.ModAPI.Ingame;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using VRageMath;
 
@@ -43,9 +44,8 @@ namespace AerOS
         private void InitializeDependencies()
         {
             // 初始化硬件
-            string loc = "Initialization";
             var ctr = GridTerminalSystem.GetBlockWithName("ctr") as IMyShipController;
-            if (ctr == null) { logger.Log(loc, "错误: 未找到控制器 'ctr'"); return; }
+            if (ctr == null) { logger.Log( "错误: 未找到控制器 'ctr'", 3 ); return; }
             var gyros = GetBlocksOfType<IMyGyro>();
             var thrusts = GetBlocksOfType<IMyThrust>();
             var lcds = GetBlocksOfType<IMyTextPanel>();
@@ -57,7 +57,13 @@ namespace AerOS
             _dependencies.Register<List<IMyTextPanel>>(lcds);
 
             _dependencies.Register<ITimeProvider>(new TimeProvider());
-            _dependencies.Register<FlightControllerConfig>(new FlightControllerConfig { PIDController = new PIDController(6, 0.01, 0.30), });
+            _dependencies.Register<FlightControllerConfig>(new FlightControllerConfig
+            {
+                PIDController = new PIDController(22.3, 0.002, 0.15),
+                MaxAngularVelocity = 70,
+                BrakeThreshold = 67,
+                PredictiveBrakeFactor = 0.18
+            });
             _dependencies.Register<IMyIntergridCommunicationSystem>(IGC);
             _dependencies.Register<ILogger>(logger);
 
@@ -72,12 +78,6 @@ namespace AerOS
             if (logc < 20) logc++;
             else
             {
-                foreach (IMyBroadcastListener _ch in CH.GetSubscriptions())
-                {
-                    logger.Log("MSG", CH.GetMessage(_ch).Data.ToString());
-                    //logger.Log("MSG", "信息更新\n{}");
-                }
-
                 foreach (string log in logger.GetLogs())
                 {
                     Echo(log);
@@ -87,11 +87,10 @@ namespace AerOS
         }
         private List<T> GetBlocksOfType<T>() where T : class
         {
-            string loc = "InitializeDevice";
             var blocks = new List<T>();
             GridTerminalSystem.GetBlocksOfType(blocks);
             blocks = blocks.Where(b => (b as IMyTerminalBlock)?.IsFunctional == true).ToList();
-            logger.Log(loc, $"找到 {blocks.Count} 个{blocks.FirstOrDefault()}");
+            logger.Log($"找到 {blocks.Count} 个{blocks.FirstOrDefault()}", 1 );
             return blocks;
         }
 
@@ -152,7 +151,7 @@ namespace AerOS
         }
         public interface ILogger
         {
-            void Log(string msg_from, string message);
+            void Log( string msg, short level = 0);
             void Wrap();
         }
 
@@ -173,7 +172,6 @@ namespace AerOS
             private Vector3D _integral = Vector3D.Zero;
             private Vector3D _previousError = Vector3D.Zero;
             private Vector3D _previousDerivative = Vector3D.Zero;
-            private double _derivativeSmoothingFactor = 0.5; // 微分项平滑因子
 
             public PIDController(double kp, double ki, double kd)
             {
@@ -197,13 +195,6 @@ namespace AerOS
 
                 // 微分项平滑导数计算
                 Vector3D derivative = (error - _previousError) / deltaTime;
-
-                // 应用平滑滤波
-                if (_previousError != Vector3D.Zero)
-                {
-                    derivative = _previousDerivative * _derivativeSmoothingFactor +
-                                derivative * (1 - _derivativeSmoothingFactor);
-                }
 
                 _previousError = error;
                 _previousDerivative = derivative;
@@ -230,13 +221,24 @@ namespace AerOS
             private Vector3D _previousAngularVelocity = Vector3D.Zero;
             private MatrixD _targetAttitude;
 
+            private double _maxAngularVelocity; // 最大角速度
+            private double _brakeThreshold; // 制动阈值
+            private double _predictiveBrakeFactor; // 预测制动因子
+
             private readonly ILogger _logger;
 
             public FlightController(DependencyContainer dependencies)
             {
                 _controller = dependencies.Resolve<IMyShipController>();
                 _gyros = dependencies.Resolve<List<IMyGyro>>();
-                _pidController = dependencies.Resolve<FlightControllerConfig>().PIDController;
+
+                // 获取配置参数
+                var config = dependencies.Resolve<FlightControllerConfig>();
+                _pidController = config.PIDController;
+                _maxAngularVelocity = config.MaxAngularVelocity;
+                _brakeThreshold = config.BrakeThreshold;
+                _predictiveBrakeFactor = config.PredictiveBrakeFactor;
+
                 _logger = dependencies.Resolve<ILogger>();
 
                 // 默认保持当前姿态
@@ -247,12 +249,40 @@ namespace AerOS
             {
                 if (_controller == null || _gyros == null || _gyros.Count == 0) return;
 
+                // 获取当前角速度
+                var currentAngularVelocity = _controller.GetShipVelocities().AngularVelocity;
                 // 计算当前姿态与目标姿态之间的误差
                 var error = CalculateAttitudeError(_controller.WorldMatrix, _targetAttitude);
-                // 计算角速度命令
-                var desiredAngularVelocity = _pidController.Update(error, _controller.GetShipVelocities().AngularVelocity, deltaTime);
+                var errorMagnitude = error.Length();
 
-                _previousAngularVelocity = desiredAngularVelocity;
+                // 预测制动点
+                var predictedStopDistance = PredictStopDistance(currentAngularVelocity);
+
+                // 控制逻辑
+                Vector3D desiredAngularVelocity;
+
+                if (errorMagnitude > _brakeThreshold)
+                {
+                    // 大误差区域：使用最大角速度
+                    desiredAngularVelocity = Vector3D.Normalize(error) * _maxAngularVelocity;
+                }
+                else if (errorMagnitude > predictedStopDistance * _predictiveBrakeFactor)
+                {
+                    // 预测制动区域：开始减速
+                    var brakeIntensity = errorMagnitude / (_brakeThreshold * _predictiveBrakeFactor);
+                    desiredAngularVelocity = Vector3D.Normalize(error) * _maxAngularVelocity * brakeIntensity;
+                }
+                else
+                {
+                    // 制动区域：反向最大角速度
+                    desiredAngularVelocity = -Vector3D.Normalize(currentAngularVelocity) * _maxAngularVelocity;
+
+                    // 如果角速度已经很小，则完全停止
+                    if (currentAngularVelocity.Length() < 0.02)
+                    {
+                        desiredAngularVelocity = Vector3D.Zero;
+                    }
+                }
 
                 // 应用指令
                 ApplyAngularVelocity(desiredAngularVelocity);
@@ -265,18 +295,18 @@ namespace AerOS
                 _previousAngularVelocity = Vector3D.Zero; // 重置角速度历史
             }
 
+            // 预测停止距离（基于当前角速度）
+            private double PredictStopDistance(Vector3D currentAngularVelocity)
+            {
+                double maxAngularAcceleration = _maxAngularVelocity * 2; // 根据实际情况调整
+                return (currentAngularVelocity.LengthSquared()) / (2 * maxAngularAcceleration);
+            }
+
             private void ApplyAngularVelocity(Vector3D angularVelocity)
             {
-                // 死区处理
-                double deadZone = 0.01;
-                if (angularVelocity.Length() < deadZone)
+                if (angularVelocity.Length() > _maxAngularVelocity)
                 {
-                    // 关闭所有陀螺仪
-                    foreach (var gyro in _gyros)
-                    {
-                        gyro.GyroOverride = false;
-                    }
-                    return;
+                    angularVelocity = Vector3D.Normalize(angularVelocity) * _maxAngularVelocity;
                 }
 
                 // 陀螺仪启用
@@ -323,7 +353,6 @@ namespace AerOS
                     0, 0, 0, 1
                 );
             }
-            //_logger.Log("Update", $"ErrorAngle: {angle}\nErrorAxis: {axis}\n");
             private void GetAxisAngleFromMatrix(MatrixD matrix, out Vector3D axis, out double angle)
             {
                 // 计算旋转角度
@@ -433,7 +462,8 @@ namespace AerOS
         {
             private List<string> _logs = new List<string>();
             private readonly int max_logs = 16;
-            public void Log(string msg_from, string msg) { _logs.Add($"[{msg_from}]: {msg}"); Wrap(); }
+            private List<string> levels = new List<string> { "debug", "info", "warn", "error"};
+            public void Log(string msg, short level = 0) { _logs.Add($"[{levels[level]}]: { msg }"); Wrap(); }
             public List<string> GetLogs() { return _logs; }
             public void Wrap() { if (_logs.Count > 2 * max_logs) _logs = _logs.Skip(50).ToList(); }
             public void Purge() { _logs = new List<string>(); }
@@ -443,6 +473,9 @@ namespace AerOS
         public struct FlightControllerConfig
         {
             public IPIDController PIDController;
+            public double MaxAngularVelocity { get; set; }
+            public double BrakeThreshold { get; set; }
+            public double PredictiveBrakeFactor { get; set; }
         }
         // 安全交换协议
         //public struct SafeSwappingProtocol
